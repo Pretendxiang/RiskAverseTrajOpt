@@ -1,3 +1,4 @@
+import os 
 import scipy.sparse as sp
 import numpy as np
 import osqp
@@ -10,7 +11,7 @@ rcParams['font.family'] = 'serif'
 rcParams['font.size'] = 14
 rc('text', usetex=True)
 import jax.numpy as jnp
-from jax import jacfwd, jit, vmap
+from jax import jacfwd, jit, vmap, device_get
 from functools import partial
 from jax.config import config
 config.update("jax_enable_x64", True)
@@ -21,8 +22,8 @@ B_compute_solution_base = True
 B_plot_results_saa = True
 B_validate_monte_carlo = True
 B_plot_computation_times = True
-alphas = [0.01, 0.02, 0.05, 0.1]
-num_repeats_saa = 30
+alphas = [0.01] #[0.01, 0.02, 0.05, 0.1]
+num_repeats_saa = 1 #30
 num_scp_iters_max = 15
 np.random.seed(0)
 print("---------------------------------------")
@@ -148,7 +149,7 @@ class Model:
         u_initial_guess = u_initial_guess + 1e-2
         for t in range(S):
             us = us.at[t, :].set(u_initial_guess)
-        return us
+        return np.array(us)
 
     @partial(jit, static_argnums=(0,))
     def force_on_pedestrian(self, x, 
@@ -401,7 +402,7 @@ class Model:
         #        min (1/2 z^T P z + q^T z)
         # where z = umat is the optimization variable.
         P, q = self.get_objective_coeffs_jax()
-        P, q = sp.csc_matrix(P.to_py()), q.to_py()
+        P, q = sp.csc_matrix(jnp.asarray(P)), jnp.asarray(q)
         return P, q
 
     def get_constraints_coeffs(self, us_mat, scp_iter):
@@ -413,14 +414,19 @@ class Model:
         As, ls, us = self.get_all_constraints_coeffs_all(us_mat)
 
         # Jax => numpy
-        A_con, l_con, u_con = A_con.to_py(), l_con.to_py(), u_con.to_py()
-        As, ls, us = np.copy(As), np.copy(ls), np.copy(us)
+        A_con, l_con, u_con = map(device_get, (A_con, l_con, u_con))
+        As, ls, us = map(device_get, (As, ls, us))
+
+        # Creating copies to avoid modifying read-only arrays
+        As_copy = np.copy(As)
+        ls_copy = np.copy(ls)
+        us_copy = np.copy(us)
 
         if scp_iter < 1:
             # remove separation distance avoidance
-            As[n_x:] *= 0
-            ls[n_x:] *= 0
-            us[n_x:] *= 0
+            As_copy[n_x:] = 0
+            ls_copy[n_x:] = 0
+            us_copy[n_x:] = 0
 
         As, A_con = sp.csr_matrix(As), sp.csr_matrix(A_con)
         A = sp.vstack([As, A_con], format='csc')
@@ -433,6 +439,10 @@ class Model:
         self.P, self.q = self.get_objective_coeffs()
         self.A, self.l, self.u = self.get_constraints_coeffs(
             us_mat_p, scp_iter)
+        
+        self.P, self.q, self.A, self.l, self.u =map(device_get, 
+            (self.P, self.q, self.A, self.l, self.u))
+
         # Setup OSQP problem
         if scp_iter==0 or scp_iter==1:
             self.osqp_prob = osqp.OSQP()
@@ -520,13 +530,25 @@ if B_compute_solution_saa:
                         define_time + solve_time)
                 accuracy_error[idx_repeat, idx_alpha, scp_iter] = L2_error
                 
+            results_dir = 'results'
+            file_name = f'driving_alpha={alpha}_repeat={idx_repeat}.npy'
+            file_path = os.path.join(results_dir, file_name)
 
-            with open('results/driving_alpha='+str(alpha)+
-                '_repeat='+str(idx_repeat)+'.npy', 
-                'wb') as f:
+            # Check if the directory exists; create it if it doesn't
+            if not os.path.exists(results_dir):
+                os.makedirs(results_dir)
+
+            with open(file_path, 'wb') as f:
                 xs = model.us_to_state_trajectories(us)
-                np.save(f, us.to_py())
-                np.save(f, xs.to_py())
+                np.save(f, jnp.asarray(us))
+                np.save(f, jnp.asarray(xs))
+
+            # with open('results/driving_alpha='+str(alpha)+
+            #     '_repeat='+str(idx_repeat)+'.npy', 
+            #     'wb') as f:
+            #     xs = model.us_to_state_trajectories(us)
+            #     np.save(f, jnp.asarray(us))
+            #     np.save(f, jnp.asarray(xs))
 
     with open('results/driving_computation_times.npy', 
         'wb') as f:
@@ -563,8 +585,8 @@ if B_compute_solution_base:
     with open('results/driving_baseline.npy', 
         'wb') as f:
         xs = model.us_to_state_trajectories(us)
-        np.save(f, us.to_py())
-        np.save(f, xs.to_py())
+        np.save(f, jnp.asarray(us))
+        np.save(f, jnp.asarray(xs))
     print("---------------------------------------")
 
 
@@ -742,7 +764,7 @@ if B_plot_computation_times:
         computation_times_osqp = computation_times_osqp[:, :, :num_scp_iters_max]
         computation_times_cum = computation_times_cum[:, :, :num_scp_iters_max]
         accuracy_error = accuracy_error[:, :, :num_scp_iters_max]
-    idx = 1
+    idx = 0
     first_scp_iter = 2
     accuracy_error_median = np.median(accuracy_error, axis=0)
     accuracy_error_median = accuracy_error_median[idx, :]
